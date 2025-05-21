@@ -4,76 +4,189 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import scipy.signal
 import time
+from sklearn.cluster import DBSCAN
 
 # Configuration parameters
 SAMPLE_RATE = 44100          # Audio sampling rate (Hz)
-CHIRP_DURATION = 0.01        # Chirp duration (seconds)
-CHIRP_FREQ_START = 18000     # Start frequency (Hz)
-CHIRP_FREQ_END = 20000       # End frequency (Hz)
-RECORD_DURATION = 0.1        # Record duration (seconds)
+CHIRP_DURATION = 0.02        # Chirp duration (seconds)
+CHIRP_FREQ_START = 8000      # Start frequency (Hz)
+CHIRP_FREQ_END = 12000       # End frequency (Hz)
+RECORD_DURATION = 0.15       # Record duration (seconds)
 SPEED_OF_SOUND = 343         # Speed of sound (m/s)
-MAX_DISTANCE = 10            # Max detectable distance (m)
+MAX_DISTANCE = 5             # Max detectable distance (m)
 MIN_DISTANCE = 0.3           # Min detectable distance (m)
-CHIRP_INTERVAL = 0.5         # Interval between chirps (seconds)
-MAX_CHIRPS = 50              # Total chirps to emit
-UPDATE_INTERVAL = 10         # Update plot every 10 chirps
-GRID_RESOLUTION = 20         # Voxel grid resolution (20x20x20)
-LAPTOP_HEIGHT = 0.5          # Laptop height (m, e.g., on a table)
+MOVE_DISTANCE = 0.1          # Distance to move laptop (meters, 10 cm)
+CHIRP_PAIR_INTERVAL = 2.0    # Time between chirps in a pair (seconds)
+MAX_PAIRS = 10               # Number of chirp pairs (20 chirps total)
+UPDATE_INTERVAL = 5          # Update plot every 5 pairs
+LAPTOP_HEIGHT = 0.5          # Laptop height (m)
 
 # Global variables
-all_distances = []           # Store all detected distances
-all_points_3d = []           # Store all 3D points (x, y, z)
-room_dimensions = [0, 0, 0]  # [length, width, height]
-laptop_pos = [0, 0, LAPTOP_HEIGHT]  # Laptop position (x, y, z)
+all_distances = []
+all_amplitudes = []
+all_points_3d = []
+room_dimensions = [0, 0, 0]
+laptop_pos = [0, 0, LAPTOP_HEIGHT]
 
 def generate_chirp(duration, sample_rate, f_start, f_end):
-    """Generate a linear chirp signal."""
+    """Generate a chirp signal."""
     t = np.linspace(0, duration, int(sample_rate * duration))
     chirp = scipy.signal.chirp(t, f_start, duration, f_end, method='linear')
     return chirp / np.max(np.abs(chirp))
 
-def play_and_record(chirp, sample_rate, record_duration):
-    """Play chirp and record reflections."""
+def play_and_record(chirp, sample_rate, record_duration, pair_num, position):
+    """Play chirp, record reflections, and save raw recording for debugging."""
     print("Playing chirp and recording reflections (keep room quiet)...")
     sd.play(chirp, sample_rate)
     recording = sd.rec(int(record_duration * sample_rate), samplerate=sample_rate, channels=1)
     sd.wait()
-    return recording.flatten()
+    recording = recording.flatten()
+    # Debug: Save raw recording
+    t = np.linspace(0, record_duration, len(recording))
+    plt.figure(figsize=(10, 6))
+    plt.plot(t, recording, label="Raw Recording")
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Amplitude")
+    plt.title(f"Raw Recording (Pair {pair_num}, Position {position})")
+    plt.legend()
+    plt.grid(True)
+    filename = f"raw_recording_{pair_num}_{position}.png"
+    plt.savefig(filename)
+    plt.close()
+    print(f"Raw recording plot saved as {filename}")
+    return recording
 
-def detect_reflections(chirp, recording, sample_rate):
-    """Detect reflection times using cross-correlation."""
+def detect_reflections(chirp, recording, sample_rate, pair_num, position):
+    """Detect reflection times and amplitudes, with debug output."""
     corr = scipy.signal.correlate(recording, chirp, mode='full')
     lags = scipy.signal.correlation_lags(len(recording), len(chirp), mode='full')
-    corr = corr / np.max(np.abs(corr))
     times = lags / sample_rate
-    peaks, _ = scipy.signal.find_peaks(corr, height=0.05, distance=int(0.002 * sample_rate))
+    if np.max(np.abs(corr)) == 0:
+        print("Cross-correlation is zero. No signal detected.")
+        return [], []
+    corr = corr / np.max(np.abs(corr))
+    # Debug: Save cross-correlation plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(times, corr, label="Cross-Correlation")
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Correlation")
+    plt.title(f"Cross-Correlation (Pair {pair_num}, Position {position})")
+    plt.legend()
+    plt.grid(True)
+    filename = f"cross_correlation_{pair_num}_{position}.png"
+    plt.savefig(filename)
+    plt.close()
+    print(f"Cross-correlation plot saved as {filename}")
+    
+    peaks, properties = scipy.signal.find_peaks(corr, height=0.01, distance=int(0.001 * sample_rate))
     reflection_times = times[peaks]
-    valid_times = [t for t in reflection_times if 0 < t < (2 * MAX_DISTANCE / SPEED_OF_SOUND)]
-    return valid_times
+    amplitudes = properties['peak_heights']
+    valid_indices = [i for i, t in enumerate(reflection_times) if 0 < t < (2 * MAX_DISTANCE / SPEED_OF_SOUND)]
+    return [reflection_times[i] for i in valid_indices], [amplitudes[i] for i in valid_indices]
 
 def time_to_distance(times):
     """Convert reflection times to distances."""
     return [(t * SPEED_OF_SOUND) / 2 for t in times]
 
-def estimate_room_dimensions(distances, iteration):
-    """Estimate room dimensions and laptop position using detected distances."""
+def cluster_reflections(distances, amplitudes):
+    """Cluster reflections to identify surfaces and objects."""
     if not distances:
-        return [5, 5, 5], [0, 0, LAPTOP_HEIGHT]  # Fallback
+        return [], [], []
     
-    # Cluster distances to find walls (largest consistent distances in opposite directions)
-    distances = sorted(distances)
-    max_dist = distances[-1]  # Potential diagonal
+    # Cluster based on distances
+    X = np.array(distances).reshape(-1, 1)
+    clustering = DBSCAN(eps=0.1, min_samples=2).fit(X)
+    labels = clustering.labels_
     
-    # Assume laptop is not centered; find min/max distances in each direction
+    # Group distances and amplitudes by cluster
+    clusters = {}
+    cluster_amplitudes = {}
+    for label, dist, amp in zip(labels, distances, amplitudes):
+        if label == -1:  # Noise/outliers treated as individual objects
+            label = f"outlier_{dist}"
+        if label not in clusters:
+            clusters[label] = []
+            cluster_amplitudes[label] = []
+        clusters[label].append(dist)
+        cluster_amplitudes[label].append(amp)
+    
+    # Average distances and amplitudes per cluster
+    cluster_distances = []
+    cluster_avg_amplitudes = []
+    cluster_sizes = []
+    for label in clusters:
+        avg_dist = np.mean(clusters[label])
+        avg_amp = np.mean(cluster_amplitudes[label])
+        cluster_distances.append(avg_dist)
+        cluster_avg_amplitudes.append(avg_amp)
+        cluster_sizes.append(len(clusters[label]))
+    
+    return cluster_distances, cluster_avg_amplitudes, cluster_sizes
+
+def calculate_tdoa(times_a, times_b, amplitudes_a, amplitudes_b):
+    """Calculate TDOA to estimate azimuth angles after clustering."""
+    if not times_a or not times_b:
+        return [], [], [], []
+    
+    distances_a = time_to_distance(times_a)
+    distances_b = time_to_distance(times_b)
+    
+    # Cluster reflections at both positions
+    cluster_distances_a, cluster_amplitudes_a, _ = cluster_reflections(distances_a, amplitudes_a)
+    cluster_distances_b, cluster_amplitudes_b, _ = cluster_reflections(distances_b, amplitudes_b)
+    
+    # Match clusters between positions
+    matched_pairs = []
+    for i, (da, aa) in enumerate(zip(cluster_distances_a, cluster_amplitudes_a)):
+        for j, (db, ab) in enumerate(zip(cluster_distances_b, cluster_amplitudes_b)):
+            if abs(da - db) < 0.1 and abs(aa - ab) < 0.2:
+                matched_pairs.append((i, j, da, aa))
+                break
+    
+    # Calculate TDOA for matched clusters
+    tdoas = []
+    matched_distances = []
+    matched_amplitudes = []
+    for i, j, d, a in matched_pairs:
+        # Find representative ToA for each cluster (e.g., median)
+        cluster_times_a = [t for t, d in zip(times_a, distances_a) if abs(d - cluster_distances_a[i]) < 0.1]
+        cluster_times_b = [t for t, d in zip(times_b, distances_b) if abs(d - cluster_distances_b[j]) < 0.1]
+        if cluster_times_a and cluster_times_b:
+            tdoa = np.median(cluster_times_b) - np.median(cluster_times_a)
+            tdoas.append(tdoa)
+            matched_distances.append(d)
+            matched_amplitudes.append(a)
+    
+    # Calculate azimuth angles
+    azimuths = []
+    for tdoa in tdoas:
+        sin_theta = (tdoa * SPEED_OF_SOUND) / MOVE_DISTANCE
+        sin_theta = np.clip(sin_theta, -1, 1)
+        theta = np.arcsin(sin_theta) * 180 / np.pi
+        azimuths.append(theta)
+    
+    return matched_distances, matched_amplitudes, tdoas, azimuths
+
+def infer_elevation(amplitudes):
+    """Infer elevation angles using amplitude (simplified)."""
+    amplitudes = np.array(amplitudes) / np.max(amplitudes)
+    elevations = [30 * (1 - amp) for amp in amplitudes]  # 0° to 30°
+    return elevations
+
+def estimate_room_dimensions(distances, angles):
+    """Estimate room dimensions and laptop position."""
+    if not distances:
+        return [5, 5, 5], [0, 0, LAPTOP_HEIGHT]
+    
     x_pos, x_neg, y_pos, y_neg, z_pos = [], [], [], [], []
-    for d in distances:
+    for d, (azimuth, elevation) in zip(distances, angles):
         if d < MIN_DISTANCE or d > MAX_DISTANCE:
             continue
-        # Simulate directional scanning based on iteration
-        angle = ((iteration % 360) + (distances.index(d) * 45)) * np.pi / 180
-        x = d * np.cos(angle)
-        y = d * np.sin(angle)
-        z = (d / max_dist) * (max_dist / 2) if max_dist > 0 else d / 2
+        azimuth_rad = azimuth * np.pi / 180
+        elevation_rad = elevation * np.pi / 180
+        x = d * np.cos(azimuth_rad) * np.cos(elevation_rad)
+        y = d * np.sin(azimuth_rad) * np.cos(elevation_rad)
+        z = d * np.sin(elevation_rad) + LAPTOP_HEIGHT
         if x > 0:
             x_pos.append(abs(x))
         else:
@@ -85,120 +198,135 @@ def estimate_room_dimensions(distances, iteration):
         if z > LAPTOP_HEIGHT:
             z_pos.append(z - LAPTOP_HEIGHT)
     
-    # Estimate room dimensions (double the distance to account for walls on both sides)
     length = (max(x_pos, default=2) + max(x_neg, default=2)) if x_pos or x_neg else 4
     width = (max(y_pos, default=2) + max(y_neg, default=2)) if y_pos or y_neg else 4
     height = max(z_pos, default=2) + LAPTOP_HEIGHT if z_pos else 2.5
     
-    # Ensure dimensions are reasonable (cap at max distance)
+    max_dist = max(distances) if distances else 5
     length = min(length, max_dist)
     width = min(width, max_dist)
     height = min(height, max_dist)
     
-    # Estimate laptop position (offset based on min distances)
     laptop_x = max(x_neg, default=length/2) - max(x_pos, default=length/2)
     laptop_y = max(y_neg, default=width/2) - max(y_pos, default=width/2)
     
     return [length, width, height], [laptop_x, laptop_y, LAPTOP_HEIGHT]
 
-def map_to_3d(distances, iteration, laptop_pos, room_dim):
-    """Map distances to 3D points relative to laptop position."""
-    points = []
-    max_dist = max(distances) if distances else 5
-    for i, d in enumerate(distances):
+def map_to_3d(distances, angles, cluster_sizes, laptop_pos, room_dim):
+    """Map distances to 3D points, distinguishing walls and objects."""
+    walls = []  # For large clusters (walls, floor, ceiling)
+    objects = []  # For small clusters (furniture)
+    for d, (azimuth, elevation), size in zip(distances, angles, cluster_sizes):
         if MIN_DISTANCE <= d <= MAX_DISTANCE:
-            # Simulate directional scanning
-            angle = ((iteration % 360) + (i * 45)) * np.pi / 180
-            x = laptop_pos[0] + d * np.cos(angle)
-            y = laptop_pos[1] + d * np.sin(angle)
-            z = laptop_pos[2] + (d / max_dist) * (room_dim[2] - laptop_pos[2])
-            # Ensure points are within room bounds
+            azimuth_rad = azimuth * np.pi / 180
+            elevation_rad = elevation * np.pi / 180
+            x = laptop_pos[0] + d * np.cos(azimuth_rad) * np.cos(elevation_rad)
+            y = laptop_pos[1] + d * np.sin(azimuth_rad) * np.cos(elevation_rad)
+            z = laptop_pos[2] + d * np.sin(elevation_rad)
             if (abs(x) <= room_dim[0]/2 and
                 abs(y) <= room_dim[1]/2 and
                 0 <= z <= room_dim[2]):
-                points.append((x, y, z))
-    return points
+                if size >= 5:  # Large clusters are walls/floor/ceiling
+                    walls.append((x, y, z, d))
+                else:  # Small clusters are objects
+                    objects.append((x, y, z))
+    return walls, objects
 
-def create_voxel_grid(points, resolution, room_dim):
-    """Create a 3D voxel grid for density visualization."""
-    if not points:
-        return np.zeros((resolution, resolution, resolution))
-    x, y, z = zip(*points)
-    grid = np.zeros((resolution, resolution, resolution))
-    for i in range(len(x)):
-        # Scale coordinates to grid indices
-        xi = int(((x[i] + room_dim[0]/2) / room_dim[0]) * (resolution - 1))
-        yi = int(((y[i] + room_dim[1]/2) / room_dim[1]) * (resolution - 1))
-        zi = int((z[i] / room_dim[2]) * (resolution - 1))
-        if 0 <= xi < resolution and 0 <= yi < resolution and 0 <= zi < resolution:
-            grid[xi, yi, zi] += 1
-    return grid
-
-def plot_3d_map(points, iteration, room_dim, laptop_pos, filename_prefix="room_3d_map"):
-    """Generate a 3D voxel plot of the room."""
+def plot_wireframe(walls, objects, room_dim, laptop_pos, pair_num):
+    """Generate a 3D wireframe representation of the room and objects."""
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
-    # Plot room boundaries
+    
+    # Draw room (four walls, floor, ceiling) as a wireframe box
     x = [-room_dim[0]/2, room_dim[0]/2]
     y = [-room_dim[1]/2, room_dim[1]/2]
     z = [0, room_dim[2]]
-    ax.plot3D(x, [y[0], y[0]], [z[0], z[0]], 'b-', alpha=0.2)
-    ax.plot3D(x, [y[1], y[1]], [z[0], z[0]], 'b-', alpha=0.2)
-    ax.plot3D(x, [y[0], y[0]], [z[1], z[1]], 'b-', alpha=0.2)
-    ax.plot3D(x, [y[1], y[1]], [z[1], z[1]], 'b-', alpha=0.2)
-    ax.plot3D([x[0], x[0]], y, [z[0], z[0]], 'b-', alpha=0.2)
-    ax.plot3D([x[1], x[1]], y, [z[0], z[0]], 'b-', alpha=0.2)
-    ax.plot3D([x[0], x[0]], y, [z[1], z[1]], 'b-', alpha=0.2)
-    ax.plot3D([x[1], x[1]], y, [z[1], z[1]], 'b-', alpha=0.2)
-    ax.plot3D([x[0], x[0]], [y[0], y[0]], z, 'b-', alpha=0.2)
-    ax.plot3D([x[0], x[0]], [y[1], y[1]], z, 'b-', alpha=0.2)
-    ax.plot3D([x[1], x[1]], [y[0], y[0]], z, 'b-', alpha=0.2)
-    ax.plot3D([x[1], x[1]], [y[1], y[1]], z, 'b-', alpha=0.2)
+    # Floor
+    ax.plot3D(x, [y[0], y[0]], [z[0], z[0]], 'b-')
+    ax.plot3D(x, [y[1], y[1]], [z[0], z[0]], 'b-')
+    ax.plot3D([x[0], x[0]], y, [z[0], z[0]], 'b-')
+    ax.plot3D([x[1], x[1]], y, [z[0], z[0]], 'b-')
+    # Ceiling
+    ax.plot3D(x, [y[0], y[0]], [z[1], z[1]], 'b-')
+    ax.plot3D(x, [y[1], y[1]], [z[1], z[1]], 'b-')
+    ax.plot3D([x[0], x[0]], y, [z[1], z[1]], 'b-')
+    ax.plot3D([x[1], x[1]], y, [z[1], z[1]], 'b-')
+    # Vertical edges
+    ax.plot3D([x[0], x[0]], [y[0], y[0]], z, 'b-')
+    ax.plot3D([x[0], x[0]], [y[1], y[1]], z, 'b-')
+    ax.plot3D([x[1], x[1]], [y[0], y[0]], z, 'b-')
+    ax.plot3D([x[1], x[1]], [y[1], y[1]], z, 'b-')
+    
+    # Plot detected walls as planes (simplified as lines along the room edges)
+    for x, y, z, d in walls:
+        # Determine which surface this is based on position
+        if abs(z - LAPTOP_HEIGHT) < 0.1:  # Near laptop height, likely a wall
+            if abs(x - (-room_dim[0]/2)) < 0.5:  # Left wall
+                ax.plot3D([-room_dim[0]/2, -room_dim[0]/2], y, [0, room_dim[2]], 'g-', linewidth=2)
+            elif abs(x - (room_dim[0]/2)) < 0.5:  # Right wall
+                ax.plot3D([room_dim[0]/2, room_dim[0]/2], y, [0, room_dim[2]], 'g-', linewidth=2)
+            elif abs(y - (-room_dim[1]/2)) < 0.5:  # Front wall
+                ax.plot3D(x, [-room_dim[1]/2, -room_dim[1]/2], [0, room_dim[2]], 'g-', linewidth=2)
+            elif abs(y - (room_dim[1]/2)) < 0.5:  # Back wall
+                ax.plot3D(x, [room_dim[1]/2, room_dim[1]/2], [0, room_dim[2]], 'g-', linewidth=2)
+        elif abs(z - 0) < 0.5:  # Floor
+            ax.plot3D(x, y, [0, 0], 'g-', linewidth=2)
+        elif abs(z - room_dim[2]) < 0.5:  # Ceiling
+            ax.plot3D(x, y, [room_dim[2], room_dim[2]], 'g-', linewidth=2)
+    
+    # Plot objects as small wireframe boxes
+    for x, y, z in objects:
+        # Simplified: Draw a small cube (0.2m sides) to represent an object
+        r = 0.1  # Half-side length
+        ax.plot3D([x-r, x+r], [y-r, y-r], [z-r, z-r], 'r-')
+        ax.plot3D([x-r, x+r], [y+r, y+r], [z-r, z-r], 'r-')
+        ax.plot3D([x-r, x-r], [y-r, y+r], [z-r, z-r], 'r-')
+        ax.plot3D([x+r, x+r], [y-r, y+r], [z-r, z-r], 'r-')
+        ax.plot3D([x-r, x+r], [y-r, y-r], [z+r, z+r], 'r-')
+        ax.plot3D([x-r, x+r], [y+r, y+r], [z+r, z+r], 'r-')
+        ax.plot3D([x-r, x-r], [y-r, y+r], [z+r, z+r], 'r-')
+        ax.plot3D([x+r, x+r], [y-r, y+r], [z+r, z+r], 'r-')
+        ax.plot3D([x-r, x-r], [y-r, y-r], [z-r, z+r], 'r-')
+        ax.plot3D([x+r, x+r], [y-r, y-r], [z-r, z+r], 'r-')
+        ax.plot3D([x-r, x-r], [y+r, y+r], [z-r, z+r], 'r-')
+        ax.plot3D([x+r, x+r], [y+r, y+r], [z-r, z+r], 'r-')
+    
     # Plot laptop position
     ax.scatter([laptop_pos[0]], [laptop_pos[1]], [laptop_pos[2]], c='r', marker='o', s=100, label='Laptop')
-    # Create voxel grid
-    voxel_grid = create_voxel_grid(points, GRID_RESOLUTION, room_dim)
-    nonzero = voxel_grid > 0
-    if np.any(nonzero):
-        x, y, z = np.indices(voxel_grid.shape)
-        x = (x[nonzero] / (GRID_RESOLUTION - 1)) * room_dim[0] - room_dim[0]/2
-        y = (y[nonzero] / (GRID_RESOLUTION - 1)) * room_dim[1] - room_dim[1]/2
-        z = (z[nonzero] / (GRID_RESOLUTION - 1)) * room_dim[2]
-        intensities = voxel_grid[nonzero]
-        ax.scatter(x, y, z, c=intensities, cmap='viridis', s=50, alpha=0.6, label='Density')
+    
     ax.set_xlabel('X (meters)')
     ax.set_ylabel('Y (meters)')
     ax.set_zlabel('Z (meters)')
     ax.set_xlim(-room_dim[0]/2, room_dim[0]/2)
     ax.set_ylim(-room_dim[1]/2, room_dim[1]/2)
     ax.set_zlim(0, room_dim[2])
-    plt.title(f"3D Room Map (Chirp {iteration})")
+    plt.title(f"Wireframe Room Map (Pair {pair_num})")
     plt.legend()
-    filename = f"{filename_prefix}_{iteration}.png"
+    filename = f"wireframe_map_{pair_num}.png"
     plt.savefig(filename)
     plt.close()
-    print(f"3D map saved as {filename}")
+    print(f"Wireframe map saved as {filename}")
 
-def plot_reflections(chirp, recording, reflection_times, sample_rate, iteration, filename_prefix="reflection_time_plot"):
+def plot_reflections(chirp, recording, reflection_times, amplitudes, sample_rate, pair_num, position):
     """Plot emitted and recorded signals with reflection times."""
     t = np.linspace(0, len(recording)/sample_rate, len(recording))
     plt.figure(figsize=(10, 6))
     plt.plot(t, recording, label="Recorded Signal")
     plt.plot(t[:len(chirp)], chirp, label="Emitted Chirp", alpha=0.5)
-    for rt in reflection_times:
-        plt.axvline(x=rt, color='r', linestyle='--', alpha=0.5, label="Reflection" if rt == reflection_times[0] else "")
+    for rt, amp in zip(reflection_times, amplitudes):
+        plt.axvline(x=rt, color='r', linestyle='--', alpha=amp, label="Reflection" if rt == reflection_times[0] else "")
     plt.xlabel("Time (seconds)")
     plt.ylabel("Amplitude")
-    plt.title(f"Chirp and Reflection Times (Chirp {iteration})")
+    plt.title(f"Chirp and Reflection Times (Pair {pair_num}, Position {position})")
     plt.legend()
     plt.grid(True)
-    filename = f"{filename_prefix}_{iteration}.png"
+    filename = f"reflection_time_plot_{pair_num}_{position}.png"
     plt.savefig(filename)
     plt.close()
     print(f"Reflection time plot saved as {filename}")
 
 def main():
-    """Continuously emit chirps, capture reflections, and map room in 3D."""
+    """Emit chirp pairs, prompt user movement, and map room in 3D."""
     print("Checking audio devices...")
     try:
         sd.check_output_settings(device=None, channels=1, dtype='float32', samplerate=SAMPLE_RATE)
@@ -208,52 +336,74 @@ def main():
         print("Ensure speaker and microphone are enabled.")
         return
     
-    global all_distances, all_points_3d, room_dimensions, laptop_pos
+    global all_distances, all_amplitudes, all_points_3d, room_dimensions, laptop_pos
     
-    for chirp_num in range(1, MAX_CHIRPS + 1):
-        print(f"\nChirp {chirp_num}/{MAX_CHIRPS}")
-        # Generate chirp
-        f_start = CHIRP_FREQ_START + (chirp_num % 5) * 100
-        f_end = CHIRP_FREQ_END + (chirp_num % 5) * 100
-        chirp = generate_chirp(CHIRP_DURATION, SAMPLE_RATE, f_start, f_end)
+    print("\nInstructions:")
+    print("For each pair:")
+    print("1. Position A: Keep the laptop still and press Enter to emit the first chirp.")
+    print("2. Position B: Move the laptop 10 cm to the right, then press Enter to emit the second chirp.")
+    print("Repeat for 10 pairs (20 chirps total). Keep movements consistent.")
+    
+    for pair_num in range(1, MAX_PAIRS + 1):
+        print(f"\nChirp Pair {pair_num}/{MAX_PAIRS}")
         
-        # Play chirp and record
-        recording = play_and_record(chirp, SAMPLE_RATE, RECORD_DURATION)
-        
-        # Detect reflections
-        reflection_times = detect_reflections(chirp, recording, SAMPLE_RATE)
-        if not reflection_times:
-            print("No reflections detected. Ensure room is quiet and place objects nearby.")
+        # Position A
+        input("Position A: Keep laptop still and press Enter to emit chirp...")
+        chirp_a = generate_chirp(CHIRP_DURATION, SAMPLE_RATE, CHIRP_FREQ_START, CHIRP_FREQ_END)
+        recording_a = play_and_record(chirp_a, SAMPLE_RATE, RECORD_DURATION, pair_num, "A")
+        times_a, amplitudes_a = detect_reflections(chirp_a, recording_a, SAMPLE_RATE, pair_num, "A")
+        if not times_a:
+            print("No reflections detected at Position A. Skipping pair.")
             continue
         
-        # Convert times to distances
-        distances = time_to_distance(reflection_times)
-        valid_distances = [d for d in distances if MIN_DISTANCE <= d <= MAX_DISTANCE]
-        if not valid_distances:
-            print("No valid distances detected.")
+        # Prompt user to move
+        input(f"Position B: Move laptop 10 cm to the right, then press Enter to emit chirp...")
+        
+        # Position B
+        chirp_b = generate_chirp(CHIRP_DURATION, SAMPLE_RATE, CHIRP_FREQ_START, CHIRP_FREQ_END)
+        recording_b = play_and_record(chirp_b, SAMPLE_RATE, RECORD_DURATION, pair_num, "B")
+        times_b, amplitudes_b = detect_reflections(chirp_b, recording_b, SAMPLE_RATE, pair_num, "B")
+        if not times_b:
+            print("No reflections detected at Position B. Skipping pair.")
             continue
         
-        print("Detected distances:")
-        for i, d in enumerate(valid_distances):
-            print(f"Surface {i+1}: {d:.2f} meters")
-        all_distances.extend(valid_distances)
+        # Calculate TDOA and angles
+        distances, amplitudes, tdoas, azimuths = calculate_tdoa(times_a, times_b, amplitudes_a, amplitudes_b)
+        if not distances:
+            print("No matched reflections between positions. Skipping pair.")
+            continue
         
-        # Estimate room dimensions and laptop position
-        room_dimensions, laptop_pos = estimate_room_dimensions(all_distances, chirp_num)
+        # Cluster sizes for distinguishing walls vs. objects
+        _, _, cluster_sizes_a = cluster_reflections(time_to_distance(times_a), amplitudes_a)
+        _, _, cluster_sizes_b = cluster_reflections(time_to_distance(times_b), amplitudes_b)
+        cluster_sizes = cluster_sizes_a[:len(distances)]  # Simplified matching
+        
+        elevations = infer_elevation(amplitudes)
+        
+        print("Detected distances, TDOA, and angles:")
+        for i, (d, tdoa, az, el) in enumerate(zip(distances, tdoas, azimuths, elevations)):
+            print(f"Surface/Object {i+1}: Distance: {d:.2f}m, TDOA: {tdoa:.6f}s, Azimuth: {az:.1f}°, Elevation: {el:.1f}°")
+        all_distances.extend(distances)
+        all_amplitudes.extend(amplitudes)
+        
+        angles = list(zip(azimuths, elevations))
+        
+        # Estimate room dimensions
+        room_dimensions, laptop_pos = estimate_room_dimensions(distances, angles)
         print(f"Estimated room: {room_dimensions[0]:.1f}m x {room_dimensions[1]:.1f}m x {room_dimensions[2]:.1f}m")
         print(f"Laptop position: ({laptop_pos[0]:.1f}, {laptop_pos[1]:.1f}, {laptop_pos[2]:.1f})")
         
-        # Map distances to 3D points
-        points_3d = map_to_3d(valid_distances, chirp_num, laptop_pos, room_dimensions)
-        all_points_3d.extend(points_3d)
+        # Map to 3D
+        walls, objects = map_to_3d(distances, angles, cluster_sizes, laptop_pos, room_dimensions)
+        all_points_3d.extend([(x, y, z) for x, y, z, _ in walls] + objects)
         
-        # Generate visualizations every UPDATE_INTERVAL chirps
-        if chirp_num % UPDATE_INTERVAL == 0 or chirp_num == MAX_CHIRPS:
-            plot_3d_map(all_points_3d, chirp_num, room_dimensions, laptop_pos)
-            plot_reflections(chirp, recording, reflection_times, SAMPLE_RATE, chirp_num)
+        # Visualize as wireframe
+        if pair_num % UPDATE_INTERVAL == 0 or pair_num == MAX_PAIRS:
+            plot_wireframe(walls, objects, room_dimensions, laptop_pos, pair_num)
+            plot_reflections(chirp_a, recording_a, times_a, amplitudes_a, SAMPLE_RATE, pair_num, "A")
+            plot_reflections(chirp_b, recording_b, times_b, amplitudes_b, SAMPLE_RATE, pair_num, "B")
         
-        # Delay between chirps
-        time.sleep(CHIRP_INTERVAL)
+        time.sleep(CHIRP_PAIR_INTERVAL)
     
     if not all_distances:
         print("No reflections detected during the session. Check audio setup and room conditions.")
